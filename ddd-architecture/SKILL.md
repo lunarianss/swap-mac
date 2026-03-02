@@ -681,21 +681,986 @@ Router Registration:
 
 ## Testing Strategy
 
-### Unit Tests
-- **Domain entities**: Test business methods
-- **Domain services**: Mock repository interfaces
-- **Convertors**: Test bidirectional conversion
-- **Repository implementations**: Mock DAOs
+DDD architecture enables comprehensive testing at every layer. Each layer should be tested independently with appropriate mocking strategies.
+
+### Testing Pyramid Overview
+
+```
+           /\
+          /E2E\         End-to-End Tests (Few)
+         /------\
+        /  Integ \      Integration Tests (Some)
+       /----------\
+      / Unit Tests \    Unit Tests (Many)
+     /--------------\
+```
+
+### Layer-by-Layer Testing Guide
+
+#### 1. Domain Entity Tests (Pure Unit Tests)
+
+**Purpose**: Test business logic in entities
+**Dependencies**: NONE
+**Mock Strategy**: No mocking needed
+
+**Example (Go)**:
+```go
+func TestContentType_IsMultiModal(t *testing.T) {
+    tests := []struct {
+        name string
+        ct   ContentType
+        want bool
+    }{
+        {name: "text is not multimodal", ct: ContentTypeText, want: false},
+        {name: "image is multimodal", ct: ContentTypeImage, want: true},
+    }
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            if got := tt.ct.IsMultiModal(); got != tt.want {
+                t.Errorf("IsMultiModal() = %v, want %v", got, tt.want)
+            }
+        })
+    }
+}
+
+func TestTask_Assign(t *testing.T) {
+    task := &Task{Status: StatusTodo}
+    err := task.Assign("user123")
+    assert.NoError(t, err)
+    assert.Equal(t, "user123", task.AssigneeID)
+}
+```
+
+**Example (Java)**:
+```java
+@Test
+public void testTaskAssign() {
+    Task task = new Task();
+    task.setStatus(TaskStatus.TODO);
+
+    task.assign("user123");
+
+    assertEquals("user123", task.getAssigneeId());
+    assertEquals(TaskStatus.IN_PROGRESS, task.getStatus());
+}
+```
+
+**What to Test**:
+- Business methods on entities
+- Value object validation
+- State transitions
+- Aggregate consistency rules
+
+---
+
+#### 2. Domain Service Tests (Unit Tests with Mocks)
+
+**Purpose**: Test business logic orchestration
+**Dependencies**: Repository interfaces
+**Mock Strategy**: Mock all repository interfaces
+
+**Example (Go with gomock)**:
+```go
+func TestDatasetServiceImpl_CreateDataset(t *testing.T) {
+    ctrl := gomock.NewController(t)
+    defer ctrl.Finish()
+
+    // Create mocks
+    mockRepo := mock_repo.NewMockIDatasetAPI(ctrl)
+    mockConfig := confmocks.NewMockIConfig(ctrl)
+
+    // Initialize service with mocks
+    service := &DatasetServiceImpl{
+        repo:          mockRepo,
+        storageConfig: mockConfig.GetDatasetItemStorage,
+        specConfig:    mockConfig.GetDatasetSpec,
+    }
+
+    tests := []struct {
+        name     string
+        dataset  *entity.Dataset
+        fields   []*entity.FieldSchema
+        mockSetup func()
+        wantErr  bool
+    }{
+        {
+            name: "successful creation",
+            dataset: &entity.Dataset{
+                Name: "test-dataset",
+                SpaceID: 123,
+            },
+            fields: []*entity.FieldSchema{
+                {Name: "input", Key: "input", Status: entity.FieldStatusAvailable},
+            },
+            mockSetup: func() {
+                mockConfig.EXPECT().GetDatasetFeature().Return(&conf.DatasetFeature{
+                    Feature: &entity.DatasetFeatures{},
+                })
+                mockConfig.EXPECT().GetDatasetSpec().Return(&conf.DatasetSpec{
+                    Spec: &entity.DatasetSpec{},
+                })
+                mockRepo.EXPECT().
+                    CreateDatasetAndSchema(gomock.Any(), gomock.Any(), gomock.Any()).
+                    Return(nil)
+            },
+            wantErr: false,
+        },
+        {
+            name: "validation failure",
+            dataset: &entity.Dataset{Name: ""},
+            fields: []*entity.FieldSchema{},
+            mockSetup: func() {
+                mockConfig.EXPECT().GetDatasetFeature().Return(&conf.DatasetFeature{})
+            },
+            wantErr: true,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            tt.mockSetup()
+            err := service.CreateDataset(context.Background(), tt.dataset, tt.fields)
+            assert.Equal(t, tt.wantErr, err != nil)
+        })
+    }
+}
+```
+
+**Example (Java with Mockito)**:
+```java
+@ExtendWith(MockitoExtension.class)
+class TaskServiceTest {
+    @Mock
+    private ITaskRepository taskRepo;
+
+    @Mock
+    private IUserRepository userRepo;
+
+    @InjectMocks
+    private TaskServiceImpl taskService;
+
+    @Test
+    void testAssignTask_Success() {
+        // Arrange
+        Long taskId = 1L;
+        String userId = "user123";
+        Task task = new Task();
+        task.setId(taskId);
+        task.setStatus(TaskStatus.TODO);
+
+        when(taskRepo.getById(taskId)).thenReturn(task);
+        when(userRepo.exists(userId)).thenReturn(true);
+        when(taskRepo.update(any(Task.class))).thenReturn(task);
+
+        // Act
+        Task result = taskService.assignTask(taskId, userId);
+
+        // Assert
+        assertEquals(userId, result.getAssigneeId());
+        verify(taskRepo).update(task);
+    }
+}
+```
+
+**What to Test**:
+- Business rule validation
+- Multi-repository coordination
+- Error handling
+- Edge cases and boundary conditions
+
+---
+
+#### 3. Repository Implementation Tests (Unit Tests with DAO Mocks)
+
+**Purpose**: Test data access coordination and caching
+**Dependencies**: DAOs (MySQL, Redis, etc.)
+**Mock Strategy**: Mock all DAO interfaces
+
+**Example (Go)**:
+```go
+func TestDatasetRepo_SetItemCount(t *testing.T) {
+    ctrl := gomock.NewController(t)
+    defer ctrl.Finish()
+
+    mockRedisDAO := redismocks.NewMockDatasetDAO(ctrl)
+    repo := &DatasetRepo{datasetRedisDAO: mockRedisDAO}
+
+    tests := []struct {
+        name      string
+        datasetID int64
+        count     int64
+        mockSetup func()
+        wantErr   bool
+    }{
+        {
+            name:      "success",
+            datasetID: 1,
+            count:     100,
+            mockSetup: func() {
+                mockRedisDAO.EXPECT().
+                    SetItemCount(gomock.Any(), int64(1), int64(100)).
+                    Return(nil)
+            },
+            wantErr: false,
+        },
+        {
+            name:      "redis error",
+            datasetID: 2,
+            count:     50,
+            mockSetup: func() {
+                mockRedisDAO.EXPECT().
+                    SetItemCount(gomock.Any(), int64(2), int64(50)).
+                    Return(errors.New("redis error"))
+            },
+            wantErr: true,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            tt.mockSetup()
+            err := repo.SetItemCount(context.Background(), tt.datasetID, tt.count)
+            assert.Equal(t, tt.wantErr, err != nil)
+        })
+    }
+}
+
+func TestDatasetRepo_GetWithCache(t *testing.T) {
+    ctrl := gomock.NewController(t)
+    defer ctrl.Finish()
+
+    mockMySQLDAO := mysqlmocks.NewMockDatasetDAO(ctrl)
+    mockRedisDAO := redismocks.NewMockDatasetDAO(ctrl)
+
+    repo := &DatasetRepo{
+        datasetMySQLDAO: mockMySQLDAO,
+        datasetRedisDAO: mockRedisDAO,
+    }
+
+    t.Run("cache hit", func(t *testing.T) {
+        expectedDataset := &model.Dataset{ID: 1, Name: "test"}
+
+        // Expect cache check
+        mockRedisDAO.EXPECT().
+            Get(gomock.Any(), int64(1)).
+            Return(expectedDataset, nil)
+
+        // Should NOT query database
+        mockMySQLDAO.EXPECT().GetByID(gomock.Any(), gomock.Any()).Times(0)
+
+        result, err := repo.GetDataset(context.Background(), 1)
+        assert.NoError(t, err)
+        assert.Equal(t, expectedDataset, result)
+    })
+
+    t.Run("cache miss", func(t *testing.T) {
+        expectedDataset := &model.Dataset{ID: 1, Name: "test"}
+
+        // Cache miss
+        mockRedisDAO.EXPECT().
+            Get(gomock.Any(), int64(1)).
+            Return(nil, redis.Nil)
+
+        // Query database
+        mockMySQLDAO.EXPECT().
+            GetByID(gomock.Any(), int64(1)).
+            Return(expectedDataset, nil)
+
+        // Update cache
+        mockRedisDAO.EXPECT().
+            Set(gomock.Any(), int64(1), expectedDataset, gomock.Any()).
+            Return(nil)
+
+        result, err := repo.GetDataset(context.Background(), 1)
+        assert.NoError(t, err)
+        assert.Equal(t, expectedDataset, result)
+    })
+}
+```
+
+**What to Test**:
+- Cache hit/miss scenarios
+- PO ↔ DO conversion
+- Transaction handling
+- Batch operations
+- Error propagation
+
+---
+
+#### 4. DTO Convertor Tests (Pure Unit Tests)
+
+**Purpose**: Test data transformation
+**Dependencies**: NONE
+**Mock Strategy**: No mocking needed
+
+**Example (Go)**:
+```go
+func TestPromptDTO2DO(t *testing.T) {
+    tests := []struct {
+        name    string
+        dto     *PromptDTO
+        want    *entity.Prompt
+        wantErr bool
+    }{
+        {
+            name: "complete conversion",
+            dto: &PromptDTO{
+                ID:          "123",
+                SpaceID:     "456",
+                DisplayName: "Test Prompt",
+                Description: "Test Description",
+            },
+            want: &entity.Prompt{
+                ID:      123,
+                SpaceID: 456,
+                PromptBasic: entity.PromptBasic{
+                    DisplayName: "Test Prompt",
+                    Description: "Test Description",
+                },
+            },
+            wantErr: false,
+        },
+        {
+            name: "missing required field",
+            dto: &PromptDTO{
+                ID: "123",
+                // Missing SpaceID
+            },
+            want:    nil,
+            wantErr: true,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            got, err := PromptDTO2DO(tt.dto)
+            if tt.wantErr {
+                assert.Error(t, err)
+            } else {
+                assert.NoError(t, err)
+                assert.Equal(t, tt.want, got)
+            }
+        })
+    }
+}
+
+func TestPromptDO2DTO_Bidirectional(t *testing.T) {
+    original := &entity.Prompt{
+        ID:      123,
+        SpaceID: 456,
+        PromptBasic: entity.PromptBasic{
+            DisplayName: "Test",
+        },
+    }
+
+    // Convert to DTO
+    dto := PromptDO2DTO(original)
+
+    // Convert back to DO
+    result, err := PromptDTO2DO(dto)
+
+    assert.NoError(t, err)
+    assert.Equal(t, original, result)
+}
+```
+
+**What to Test**:
+- Bidirectional conversion accuracy
+- Null/nil handling
+- Default value assignment
+- Validation during conversion
+
+---
+
+#### 5. Application Service Tests (Unit Tests with Domain Mocks)
+
+**Purpose**: Test use case orchestration
+**Dependencies**: Domain services, repositories, providers
+**Mock Strategy**: Mock domain services and external providers
+
+**Example (Go)**:
+```go
+func TestPromptManageApp_CreatePrompt(t *testing.T) {
+    ctrl := gomock.NewController(t)
+    defer ctrl.Finish()
+
+    mockPromptService := mock_service.NewMockIPromptService(ctrl)
+    mockAuthProvider := mock_provider.NewMockIAuthProvider(ctrl)
+    mockAuditProvider := mock_provider.NewMockIAuditProvider(ctrl)
+
+    app := &PromptManageApplicationImpl{
+        promptService:  mockPromptService,
+        authProvider:   mockAuthProvider,
+        auditProvider:  mockAuditProvider,
+    }
+
+    tests := []struct {
+        name      string
+        request   *CreatePromptRequest
+        mockSetup func()
+        wantErr   bool
+    }{
+        {
+            name: "successful creation",
+            request: &CreatePromptRequest{
+                SpaceID:     "123",
+                DisplayName: "Test Prompt",
+            },
+            mockSetup: func() {
+                // Mock auth check
+                mockAuthProvider.EXPECT().
+                    CheckSpacePermission(gomock.Any(), "123", "prompt:create").
+                    Return(nil)
+
+                // Mock domain service
+                mockPromptService.EXPECT().
+                    CreatePrompt(gomock.Any(), gomock.Any()).
+                    Return(int64(456), nil)
+
+                // Mock audit log
+                mockAuditProvider.EXPECT().
+                    Log(gomock.Any(), gomock.Any()).
+                    Return(nil)
+            },
+            wantErr: false,
+        },
+        {
+            name: "permission denied",
+            request: &CreatePromptRequest{
+                SpaceID:     "123",
+                DisplayName: "Test",
+            },
+            mockSetup: func() {
+                mockAuthProvider.EXPECT().
+                    CheckSpacePermission(gomock.Any(), "123", "prompt:create").
+                    Return(errors.New("permission denied"))
+            },
+            wantErr: true,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            tt.mockSetup()
+            _, err := app.CreatePrompt(context.Background(), tt.request)
+            assert.Equal(t, tt.wantErr, err != nil)
+        })
+    }
+}
+```
+
+**What to Test**:
+- Authentication and authorization
+- DTO conversion
+- Domain service orchestration
+- Audit logging
+- Error handling and translation
+
+---
+
+#### 6. API Handler Tests (Unit Tests with Application Mocks)
+
+**Purpose**: Test HTTP request/response handling
+**Dependencies**: Application services
+**Mock Strategy**: Mock application services
+
+**Example (Go with Hertz)**:
+```go
+func TestCreatePromptHandler(t *testing.T) {
+    ctrl := gomock.NewController(t)
+    defer ctrl.Finish()
+
+    mockApp := mock_app.NewMockPromptManageService(ctrl)
+    handler := &PromptHandler{promptApp: mockApp}
+
+    tests := []struct {
+        name           string
+        requestBody    string
+        mockSetup      func()
+        expectedStatus int
+    }{
+        {
+            name: "successful request",
+            requestBody: `{
+                "space_id": "123",
+                "display_name": "Test Prompt"
+            }`,
+            mockSetup: func() {
+                mockApp.EXPECT().
+                    CreatePrompt(gomock.Any(), gomock.Any()).
+                    Return(&CreatePromptResponse{PromptID: "456"}, nil)
+            },
+            expectedStatus: 200,
+        },
+        {
+            name:        "invalid JSON",
+            requestBody: `{invalid json}`,
+            mockSetup:   func() {},
+            expectedStatus: 400,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            tt.mockSetup()
+
+            // Create test context
+            ctx := &app.RequestContext{}
+            ctx.Request.SetBody([]byte(tt.requestBody))
+
+            // Call handler
+            handler.HandleCreatePrompt(context.Background(), ctx)
+
+            // Assert response
+            assert.Equal(t, tt.expectedStatus, ctx.Response.StatusCode())
+        })
+    }
+}
+```
+
+**What to Test**:
+- Request parsing and validation
+- Response formatting
+- HTTP status codes
+- Error response format
+
+---
 
 ### Integration Tests
-- **Repository layer**: Test with real database (test containers)
-- **Application services**: Test with real domain services
-- **API handlers**: Test with mock application services
+
+Integration tests verify that multiple components work together correctly.
+
+#### Repository Integration Tests
+
+**Purpose**: Test repository with real database
+**Strategy**: Use test containers or in-memory databases
+
+**Example (Go with Testcontainers)**:
+```go
+func TestDatasetRepo_Integration(t *testing.T) {
+    // Start MySQL container
+    mysqlContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+        ContainerRequest: testcontainers.ContainerRequest{
+            Image:        "mysql:8.0",
+            ExposedPorts: []string{"3306/tcp"},
+            Env: map[string]string{
+                "MYSQL_ROOT_PASSWORD": "test",
+                "MYSQL_DATABASE":      "testdb",
+            },
+        },
+        Started: true,
+    })
+    require.NoError(t, err)
+    defer mysqlContainer.Terminate(ctx)
+
+    // Get connection string
+    host, _ := mysqlContainer.Host(ctx)
+    port, _ := mysqlContainer.MappedPort(ctx, "3306")
+    dsn := fmt.Sprintf("root:test@tcp(%s:%s)/testdb", host, port.Port())
+
+    // Initialize repository with real DB
+    db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+    require.NoError(t, err)
+
+    repo := NewDatasetRepo(db, nil) // nil for cache in integration test
+
+    // Test actual database operations
+    t.Run("create and retrieve dataset", func(t *testing.T) {
+        dataset := &entity.Dataset{
+            Name:    "test-dataset",
+            SpaceID: 123,
+        }
+
+        id, err := repo.CreateDataset(ctx, dataset)
+        assert.NoError(t, err)
+        assert.NotZero(t, id)
+
+        retrieved, err := repo.GetDataset(ctx, id)
+        assert.NoError(t, err)
+        assert.Equal(t, dataset.Name, retrieved.Name)
+    })
+}
+```
+
+**Example (Java with Testcontainers)**:
+```java
+@Testcontainers
+@SpringBootTest
+class TaskRepositoryIntegrationTest {
+    @Container
+    static MySQLContainer<?> mysql = new MySQLContainer<>("mysql:8.0")
+        .withDatabaseName("testdb")
+        .withUsername("test")
+        .withPassword("test");
+
+    @Autowired
+    private TaskRepository taskRepository;
+
+    @Test
+    void testCreateAndRetrieveTask() {
+        Task task = new Task();
+        task.setTitle("Test Task");
+        task.setStatus(TaskStatus.TODO);
+
+        Long id = taskRepository.create(task);
+        assertNotNull(id);
+
+        Task retrieved = taskRepository.getById(id);
+        assertEquals("Test Task", retrieved.getTitle());
+    }
+}
+```
+
+---
 
 ### End-to-End Tests
-- Full stack tests with real dependencies
-- Test complete user flows
-- Use test databases and external service mocks
+
+E2E tests verify complete user flows through the entire stack.
+
+**Example (Go)**:
+```go
+func TestPromptWorkflow_E2E(t *testing.T) {
+    // Start test server
+    server := setupTestServer(t)
+    defer server.Shutdown()
+
+    client := &http.Client{}
+    baseURL := server.URL
+
+    t.Run("complete prompt lifecycle", func(t *testing.T) {
+        // 1. Create prompt
+        createReq := `{
+            "space_id": "123",
+            "display_name": "E2E Test Prompt",
+            "description": "Test description"
+        }`
+        resp, err := client.Post(baseURL+"/api/v1/prompts", "application/json",
+            strings.NewReader(createReq))
+        require.NoError(t, err)
+        assert.Equal(t, 200, resp.StatusCode)
+
+        var createResp CreatePromptResponse
+        json.NewDecoder(resp.Body).Decode(&createResp)
+        promptID := createResp.PromptID
+
+        // 2. Get prompt
+        resp, err = client.Get(baseURL + "/api/v1/prompts/" + promptID)
+        require.NoError(t, err)
+        assert.Equal(t, 200, resp.StatusCode)
+
+        // 3. Update prompt
+        updateReq := `{"display_name": "Updated Name"}`
+        req, _ := http.NewRequest("PUT", baseURL+"/api/v1/prompts/"+promptID,
+            strings.NewReader(updateReq))
+        resp, err = client.Do(req)
+        require.NoError(t, err)
+        assert.Equal(t, 200, resp.StatusCode)
+
+        // 4. Delete prompt
+        req, _ = http.NewRequest("DELETE", baseURL+"/api/v1/prompts/"+promptID, nil)
+        resp, err = client.Do(req)
+        require.NoError(t, err)
+        assert.Equal(t, 200, resp.StatusCode)
+    })
+}
+```
+
+---
+
+### Testing Tools by Language
+
+#### Go
+- **Testing Framework**: Built-in `testing` package
+- **Mocking**: `go.uber.org/mock/gomock` (formerly golang/mock)
+- **Assertions**: `github.com/stretchr/testify/assert`
+- **Test Containers**: `github.com/testcontainers/testcontainers-go`
+- **Table-Driven Tests**: Standard Go pattern
+
+**Generate Mocks**:
+```bash
+# Install mockgen
+go install go.uber.org/mock/mockgen@latest
+
+# Generate mocks for interfaces
+mockgen -source=domain/repo/prompt_repo.go -destination=domain/repo/mocks/mock_prompt_repo.go
+```
+
+#### Java
+- **Testing Framework**: JUnit 5
+- **Mocking**: Mockito
+- **Assertions**: AssertJ
+- **Test Containers**: Testcontainers
+- **Spring Test**: `@SpringBootTest`, `@WebMvcTest`
+
+#### Python
+- **Testing Framework**: pytest
+- **Mocking**: unittest.mock or pytest-mock
+- **Assertions**: Built-in assert
+- **Test Containers**: testcontainers-python
+- **Fixtures**: pytest fixtures
+
+#### TypeScript
+- **Testing Framework**: Jest or Vitest
+- **Mocking**: Jest mocks or Vitest mocks
+- **Assertions**: expect (Jest/Vitest)
+- **Test Containers**: testcontainers-node
+- **DI Testing**: Use framework-specific testing utilities
+
+---
+
+### Test Coverage Guidelines
+
+| Layer | Target Coverage | Priority |
+|-------|----------------|----------|
+| Domain Entities | 90%+ | High |
+| Domain Services | 85%+ | High |
+| Repositories | 80%+ | Medium |
+| Convertors | 95%+ | High |
+| Application Services | 80%+ | Medium |
+| API Handlers | 70%+ | Medium |
+
+---
+
+### Best Practices
+
+#### 1. Test Naming Conventions
+- **Go**: `TestFunctionName_Scenario`
+- **Java**: `testFunctionName_Scenario`
+- **Python**: `test_function_name_scenario`
+
+#### 2. Arrange-Act-Assert Pattern
+```
+// Arrange: Set up test data and mocks
+mockRepo.EXPECT().GetByID(1).Return(entity, nil)
+
+// Act: Execute the function under test
+result, err := service.GetEntity(ctx, 1)
+
+// Assert: Verify the results
+assert.NoError(t, err)
+assert.Equal(t, expected, result)
+```
+
+#### 3. Table-Driven Tests
+Use table-driven tests for multiple scenarios:
+```go
+tests := []struct {
+    name    string
+    input   Input
+    want    Output
+    wantErr bool
+}{
+    {name: "scenario 1", input: ..., want: ..., wantErr: false},
+    {name: "scenario 2", input: ..., want: ..., wantErr: true},
+}
+```
+
+#### 4. Test Isolation
+- Each test should be independent
+- Use `t.Run()` for subtests
+- Clean up resources in `defer` or `t.Cleanup()`
+
+#### 5. Mock Verification
+- Verify that mocks were called as expected
+- Use `gomock.Any()` for flexible matching
+- Use `Times(n)` to verify call count
+
+#### 6. Test Data Builders
+Create helper functions for test data:
+```go
+func newTestDataset(opts ...func(*entity.Dataset)) *entity.Dataset {
+    ds := &entity.Dataset{
+        Name:    "default-name",
+        SpaceID: 123,
+    }
+    for _, opt := range opts {
+        opt(ds)
+    }
+    return ds
+}
+
+// Usage
+dataset := newTestDataset(
+    func(d *entity.Dataset) { d.Name = "custom-name" },
+)
+```
+
+---
+
+### Common Testing Patterns
+
+#### Testing Error Cases
+```go
+t.Run("repository error", func(t *testing.T) {
+    mockRepo.EXPECT().
+        GetByID(gomock.Any(), int64(1)).
+        Return(nil, errors.New("database error"))
+
+    _, err := service.GetEntity(ctx, 1)
+    assert.Error(t, err)
+    assert.Contains(t, err.Error(), "database error")
+})
+```
+
+#### Testing Transactions
+```go
+t.Run("transaction rollback on error", func(t *testing.T) {
+    mockDB.EXPECT().Begin().Return(mockTx, nil)
+    mockTx.EXPECT().Rollback().Return(nil)
+
+    mockRepo.EXPECT().
+        Create(gomock.Any(), gomock.Any()).
+        Return(errors.New("constraint violation"))
+
+    err := service.CreateWithTransaction(ctx, entity)
+    assert.Error(t, err)
+})
+```
+
+#### Testing Caching
+```go
+t.Run("cache invalidation on update", func(t *testing.T) {
+    // Update database
+    mockMySQLDAO.EXPECT().
+        Update(gomock.Any(), gomock.Any()).
+        Return(nil)
+
+    // Invalidate cache
+    mockRedisDAO.EXPECT().
+        Delete(gomock.Any(), int64(1)).
+        Return(nil)
+
+    err := repo.UpdateEntity(ctx, 1, updates)
+    assert.NoError(t, err)
+})
+```
+
+---
+
+### Running Tests
+
+#### Go
+```bash
+# Run all tests
+go test ./...
+
+# Run with verbose output
+go test -v ./...
+
+# Run specific package
+go test -v ./modules/prompt/domain/service/...
+
+# Run specific test
+go test -v ./modules/prompt/... -run TestPromptService_Create
+
+# Run with coverage
+go test -cover ./...
+go test -coverprofile=coverage.out ./...
+go tool cover -html=coverage.out
+
+# Run with race detection
+go test -race ./...
+
+# Run integration tests only (with build tags)
+go test -tags=integration ./...
+```
+
+#### Java
+```bash
+# Maven
+mvn test
+mvn test -Dtest=TaskServiceTest
+mvn verify  # includes integration tests
+
+# Gradle
+./gradlew test
+./gradlew test --tests TaskServiceTest
+./gradlew integrationTest
+```
+
+#### Python
+```bash
+# Run all tests
+pytest
+
+# Run with coverage
+pytest --cov=src --cov-report=html
+
+# Run specific test
+pytest tests/test_task_service.py::test_create_task
+
+# Run with markers
+pytest -m unit
+pytest -m integration
+```
+
+---
+
+### Continuous Integration
+
+**Example GitHub Actions Workflow**:
+```yaml
+name: Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: testdb
+        ports:
+          - 3306:3306
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Run unit tests
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Run integration tests
+        run: go test -v -tags=integration ./...
+        env:
+          MYSQL_DSN: root:test@tcp(localhost:3306)/testdb
+          REDIS_ADDR: localhost:6379
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage.out
+```
+
+---
+
+### Summary: Testing Checklist
+
+- [ ] Domain entities have unit tests for all business methods
+- [ ] Domain services use mocked repositories
+- [ ] Repository implementations use mocked DAOs
+- [ ] Convertors have bidirectional conversion tests
+- [ ] Application services use mocked domain services
+- [ ] API handlers use mocked application services
+- [ ] Integration tests use test containers
+- [ ] E2E tests cover critical user flows
+- [ ] Test coverage meets targets (80%+ overall)
+- [ ] CI/CD pipeline runs all tests automatically
+- [ ] Mocks are generated and up-to-date
+- [ ] Test data builders simplify test setup
 
 ---
 
